@@ -20,10 +20,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
+import httpx
 from dotenv import load_dotenv
 from openai import OpenAI, OpenAIError
 
-load_dotenv(Path(__file__).resolve().with_name(".env"))
+load_dotenv(Path(__file__).resolve().with_name(".env"), override=True)
 
 TOKEN_RE = re.compile(r"[a-z0-9]+")
 HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+")
@@ -266,6 +267,56 @@ class OpenAIGenerator:
         return answer
 
 
+class GeminiGenerator:
+    def __init__(self, max_output_tokens: int = 300) -> None:
+        self.api_key = os.getenv("GEMINI_API_KEY", "").strip()
+        self.model = os.getenv("GEMINI_MODEL", "gemini-flash-lite-latest").strip()
+        if not self.api_key:
+            raise RuntimeError("GEMINI_API_KEY is missing from .env")
+        self.max_output_tokens = max_output_tokens
+
+    def generate(self, prompt: str) -> str:
+        models_to_try = [self.model]
+        if self.model != "gemini-flash-lite-latest":
+            models_to_try.append("gemini-flash-lite-latest")
+
+        data = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": 0.0,
+                "maxOutputTokens": self.max_output_tokens,
+            },
+        }
+
+        last_error = ""
+        for model in models_to_try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={self.api_key}"
+            for attempt in range(4):
+                try:
+                    resp = httpx.post(url, json=data, timeout=60.0)
+                    if resp.status_code == 200:
+                        result = resp.json()
+                        try:
+                            answer = result["candidates"][0]["content"]["parts"][0]["text"].strip()
+                            if answer:
+                                return answer
+                        except (KeyError, IndexError) as e:
+                            raise RuntimeError(f"Unexpected Gemini response structure: {result}") from e
+                    elif resp.status_code in (429, 503):
+                        time.sleep(2.0 * (attempt + 1))
+                        last_error = f"Gemini API error ({resp.status_code}): {resp.text}"
+                        continue
+                    else:
+                        last_error = f"Gemini API error ({resp.status_code}): {resp.text}"
+                        break
+                except httpx.RequestError as exc:
+                    time.sleep(2.0 * (attempt + 1))
+                    last_error = f"HTTP request failed: {exc}"
+                    continue
+
+        raise RuntimeError(last_error or "Gemini returned empty answer or failed all attempts")
+
+
 @dataclass(frozen=True)
 class DomainResponse:
     question: str
@@ -296,10 +347,15 @@ class DomainAssistant:
         top_k: int = 5,
     ) -> DomainAssistant:
         corpus_id, chunks = load_corpus(corpus_dir)
+        if generator is None:
+            if os.getenv("GEMINI_API_KEY"):
+                generator = GeminiGenerator()
+            else:
+                generator = OpenAIGenerator()
         return cls(
             corpus_id,
             BM25Retriever(chunks),
-            generator if generator is not None else OpenAIGenerator(),
+            generator,
             top_k,
         )
 
